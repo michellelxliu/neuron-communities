@@ -80,6 +80,9 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--kv-budget-gb", type=float, default=8.0)
     ap.add_argument("--forward-token-budget", type=int, default=49152)
     ap.add_argument("--max-parts", type=int, default=0, help="smoke/pilot: process at most this many parts of the shard")
+    ap.add_argument("--crosscheck-max-tokens", type=int, default=0,
+                    help="run the naive full-backward crosscheck only on rows with at most this many tokens (0: no cap, "
+                         "the upstream choice). The check is a diagnostic; stored attributions do not depend on it")
 
 
 # ---- provenance -----------------------------------------------------------------------------------------------------
@@ -91,6 +94,11 @@ def code_commit() -> dict:
         dirty = bool(subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
                                     capture_output=True, text=True, check=True).stdout.strip())
     except (OSError, subprocess.CalledProcessError):
+        # no .git (e.g. a copy synced to a cluster): the submitter writes .code_commit = "<sha> <dirty 0/1>"
+        f = root / ".code_commit"
+        if f.exists():
+            sha, d = f.read_text().split()[:2]
+            return {"commit": sha, "dirty": d == "1", "source": ".code_commit"}
         sha, dirty = "unknown", True
     return {"commit": sha, "dirty": dirty}
 
@@ -294,7 +302,7 @@ def run(args: argparse.Namespace) -> None:
         lo, hi = b * args.block_size, min((b + 1) * args.block_size, n_man)
         targets = [(int(man_row[i]), int(man_pos[i])) for i in range(lo, hi)]
         recs: list[dict | None] = [None] * len(targets)
-        checks0, checks, rels, n_tok, n_nonfinite_h = [], [], [], 0, 0
+        checks0, checks, rels, n_tok, n_nonfinite_h, n_skipped = [], [], [], 0, 0, 0
         for sub, toks, input_ids, attn, tpos, valid in batches(targets):
             h, grad, loss, logits = attribute(input_ids, attn, tpos)
             score = h.abs() * grad.abs()                               # upstream score, (L, B, d_mlp)
@@ -324,21 +332,31 @@ def run(args: argparse.Namespace) -> None:
                     "s_sum": sgn_c[:, jj].astype(np.float32),
                 }
                 n_tok += len(toks[jj])
-            j = int(np.random.default_rng(b * 131 + int(sub[0])).integers(len(sub)))
-            ov0, ov, rel = naive_crosscheck(input_ids[j: j + 1, : tpos[j] + 1], attn[j: j + 1, : tpos[j] + 1], tpos[j],
-                                            h[:, j], grad[:, j])
-            checks0.append(ov0); checks.append(ov); rels.append(rel)
+            rng = np.random.default_rng(b * 131 + int(sub[0]))
+            if args.crosscheck_max_tokens:
+                ok = [jj for jj in range(len(sub)) if int(tpos[jj]) + 1 <= args.crosscheck_max_tokens]
+                j = ok[int(rng.integers(len(ok)))] if ok else -1
+            else:
+                j = int(rng.integers(len(sub)))
+            if j >= 0:
+                ov0, ov, rel = naive_crosscheck(input_ids[j: j + 1, : tpos[j] + 1], attn[j: j + 1, : tpos[j] + 1], tpos[j],
+                                                h[:, j], grad[:, j])
+                checks0.append(ov0); checks.append(ov); rels.append(rel)
+            else:
+                n_skipped += 1
             del h, grad, score, val, idx, s, hv
             if DEV.startswith("cuda"):
                 torch.cuda.empty_cache()
         assert all(r is not None for r in recs)
         rows_out.extend(recs)
         blk_meta.append({"block": b, "manifest_lo": lo, "n": hi - lo, "crosscheck": checks0, "crosscheck_k": checks,
-                         "crosscheck_rel_err": rels, "nonfinite_h": n_nonfinite_h})
+                         "crosscheck_rel_err": rels, "nonfinite_h": n_nonfinite_h, "crosscheck_skipped": n_skipped})
         return n_tok
 
     for p in todo:
         t0 = time.monotonic()
+        if DEV.startswith("cuda"):
+            torch.cuda.reset_peak_memory_stats()
         rows_out: list[dict] = []
         blk_meta: list[dict] = []
         n_tok = 0
@@ -346,15 +364,18 @@ def run(args: argparse.Namespace) -> None:
             n_tok += process_block(b, rows_out, blk_meta)
         secs = time.monotonic() - t0
         pmeta_json = {"part": p, "k": K, "base_k": K0, "layers": n_layers, "d_mlp": d_mlp, "blocks": blk_meta,
-                      "seconds": secs, "prompts": len(rows_out), "tokens": n_tok, "check_layer": check_layer}
+                      "seconds": secs, "prompts": len(rows_out), "tokens": n_tok, "check_layer": check_layer,
+                      "peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30 if DEV.startswith("cuda") else None,
+                      "crosscheck_max_tokens": args.crosscheck_max_tokens}
         table = pa.Table.from_pylist(rows_out, schema=schema).replace_schema_metadata({"nc_wide": json.dumps(pmeta_json)})
         tmp = out_dir / f".part_{p:06d}.tmp.parquet"
         pq.write_table(table, tmp, compression="zstd")
         os.replace(tmp, out_dir / f"part_{p:06d}.parquet")
-        cc = np.concatenate([m["crosscheck"] for m in blk_meta]); rr = np.concatenate([m["crosscheck_rel_err"] for m in blk_meta])
+        cc = np.concatenate([m["crosscheck"] for m in blk_meta] + [[np.nan]]); rr = np.concatenate([m["crosscheck_rel_err"] for m in blk_meta] + [[np.nan]])
         print(f"part {p}: {len(rows_out)} prompts, {n_tok} tokens in {secs:.1f}s ({len(rows_out) / secs * 3600:.0f} prompts/h); "
-              f"crosscheck top{K0} overlap {cc.mean():.3f}, grad rel err max {rr.max():.2e}; "
-              f"non-finite h {sum(m['nonfinite_h'] for m in blk_meta)}", flush=True)
+              f"crosscheck top{K0} overlap {np.nanmean(cc):.3f}, grad rel err max {np.nanmax(rr):.2e} "
+              f"({sum(m['crosscheck_skipped'] for m in blk_meta)} sub-batches skipped by the length cap); "
+              f"non-finite h {sum(m['nonfinite_h'] for m in blk_meta)}; peak mem {pmeta_json['peak_mem_gib']}", flush=True)
     print(f"shard {args.shard} done", flush=True)
 
 

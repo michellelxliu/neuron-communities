@@ -8,3 +8,4 @@ dist/
 worlds/
 runs/
 slurm-*.log
+.code_commit
