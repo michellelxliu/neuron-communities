@@ -46,6 +46,27 @@ python -m neuron_communities <stage> --help
 
 For cluster runs, [stage_array.slurm](scripts/slurm/stage_array.slurm) provides a Slurm job-array template.
 
+## Wide harvest (this fork)
+
+This fork adds one harvest stage and one converter; every other stage is the upstream code, unchanged.
+
+- `attribution-wide`: the same score and mechanics as `attribution`, but keeps the top 50 neurons per layer with the
+  signed score `s = h * dlogp(top-1)/dh` (float32) and the activation `h` (float16), plus per-prompt tokens, top-1
+  token and probability, top-20 clean log-probs, per-layer `sum |s|` and `sum s`, and prompt metadata from an
+  optional `<manifest>/prompts.parquet`. Output: Parquet parts under `<out>/parts/`.
+- `wide-blocks --k 5`: writes the top-5 prefix of a wide harvest in the upstream block layout. It is bit-identical to
+  running upstream `attribution --k 5` (checked by `tests/test_wide.py`), so `world` and every later stage run on it
+  as the baseline.
+
+```bash
+python -m neuron_communities attribution-wide --manifest-dir M --out-dir H_WIDE --shard 0 --shards 1
+python -m neuron_communities wide-blocks --harvest-dir H_WIDE --out-dir H_TOP5 --k 5
+python -m neuron_communities world --harvest-dir H_TOP5 --manifest-dir M --out-dir W
+```
+
+Pin the model revision by passing a local snapshot path (`.../snapshots/<sha>`) as `--model`; it is recorded in
+`run_meta_shard*.json` together with the code commit, library versions and manifest hashes.
+
 ## Test
 
 ```bash

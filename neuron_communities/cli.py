@@ -17,6 +17,8 @@ STAGES: list[tuple[str, str, str]] = [
     ("combine",       "neuron_communities.data.combine",     "concatenate per-corpus manifests into one world"),
     ("heldout-dedup", "neuron_communities.data.heldout",     "drop held-out prompts that collide with the training manifest"),
     ("attribution",   "neuron_communities.harvest.attribution", "top-k activation x gradient neuron sets per prompt and layer"),
+    ("attribution-wide", "neuron_communities.harvest.wide",  "top-50 signed activation x gradient scores per prompt and layer (parquet)"),
+    ("wide-blocks",   "neuron_communities.harvest.wide_blocks", "top-k prefix of a wide harvest in the attribution block layout"),
     ("world",         "neuron_communities.harvest.world",    "assemble the harvest blocks into per-layer CSR matrices"),
     ("census",        "neuron_communities.graph.census",     "cross-layer co-occurrence counts with popularity-preserving nulls"),
     ("leiden",        "neuron_communities.graph.leiden",     "CPM Leiden communities on the z-gated co-occurrence graph"),
