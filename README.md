@@ -50,7 +50,7 @@ For cluster runs, [stage_array.slurm](scripts/slurm/stage_array.slurm) provides 
 
 This fork adds one harvest stage and one converter; every other stage is the upstream code, unchanged.
 
-- `attribution-wide`: the same score and mechanics as `attribution`, but keeps the top 50 neurons per layer with the
+- `attribution-wide`: the same score and mechanics as `attribution`, but keeps the top 1,000 neurons per layer with the
   signed score `s = h * dlogp(top-1)/dh` (float32) and the activation `h` (float16), plus per-prompt tokens, top-1
   token and probability, top-20 clean log-probs, per-layer `sum |s|` and `sum s`, and prompt metadata from an
   optional `<manifest>/prompts.parquet`. Output: Parquet parts under `<out>/parts/`.
@@ -63,6 +63,12 @@ python -m neuron_communities attribution-wide --manifest-dir M --out-dir H_WIDE 
 python -m neuron_communities wide-blocks --harvest-dir H_WIDE --out-dir H_TOP5 --k 5
 python -m neuron_communities world --harvest-dir H_TOP5 --manifest-dir M --out-dir W
 ```
+
+**Storage.** The top 1,000 per layer costs about 259 KB per corpus prompt (about 544 GB for 2.1M prompts). If storage
+costs need cutting, prune the stored rows (each layer's entries are in descending |s|, so a prune is a prefix): to the
+top 50 (about 17 KB/prompt), or, recommended, to max(top 50, all neurons with |s| >= 0.1 x the layer's max |s|)
+(about 36 KB/prompt, about 76 GB). The per-layer truncation statistics (`share_at_k`, `k_at_share`, `n_above_rel`)
+are kept in every row either way.
 
 Pin the model revision by passing a local snapshot path (`.../snapshots/<sha>`) as `--model`; it is recorded in
 `run_meta_shard*.json` together with the code commit, library versions and manifest hashes.

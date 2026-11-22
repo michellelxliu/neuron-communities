@@ -28,16 +28,20 @@ from neuron_communities.data import io
 REQUIRED = ("prompt_id", "slice", "task", "template_id", "split", "text")
 
 
-def write_prompt_world(records: list[dict], tokenizer, out: str | Path, provenance: dict | None = None) -> Path:
+def write_prompt_world(records: list[dict], tokenizer, out: str | Path, provenance: dict | None = None,
+                       allow_duplicates: bool = False) -> Path:
+    """Records with ``token_ids`` (a list of ints) are used as given and need no tokenizer (toy models); duplicate
+    texts are rejected unless ``allow_duplicates`` (sampled toy prompts can repeat)."""
     out = Path(out)
     assert records, "no prompts"
     for f in REQUIRED:
         assert all(f in r for r in records), f"every record needs {f!r}"
     texts = [r["text"] for r in records]
-    assert len(set(texts)) == len(texts), "duplicate prompt texts"
+    assert allow_duplicates or len(set(texts)) == len(texts), "duplicate prompt texts"
     assert len({r["prompt_id"] for r in records}) == len(records), "duplicate prompt ids"
-    ids = [tokenizer(t, add_special_tokens=True)["input_ids"] for t in texts]
+    ids = [list(r["token_ids"]) if "token_ids" in r else tokenizer(r["text"], add_special_tokens=True)["input_ids"] for r in records]
     assert all(len(x) >= 2 for x in ids)
+    records = [{k: v for k, v in r.items() if k != "token_ids"} for r in records]
 
     tok_dir = out / "tokens"
     (tok_dir / "layers" / "tokens").mkdir(parents=True, exist_ok=True)

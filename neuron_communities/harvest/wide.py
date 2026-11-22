@@ -1,11 +1,11 @@
-"""Wide attribution harvest: the top-``k`` (default 50) MLP neurons per layer with signed scores and activations.
+"""Wide attribution harvest: the top-``k`` (default 1,000) MLP neurons per layer with signed scores and activations.
 
 Same score and the same mechanics as the ``attribution`` stage (``neuron_communities/harvest/attribution.py``, left
 unchanged as the baseline): for every manifest target, ``s = h * dL/dh`` with ``h`` the SwiGLU neuron activation at
 the target position and ``L = log p(top-1 next token)``; neurons are ranked by ``|s| = |h| * |dL/dh|`` (bit for bit
 the upstream ``val_act_ga``). The differences are only in what is kept:
 
-* ``k`` neurons per layer (default 50) instead of 5, with the **signed** ``s`` and the activation ``h``;
+* ``k`` neurons per layer (default 1,000; at most d_mlp) instead of 5, with the **signed** ``s`` and the activation ``h``;
 * per prompt: the token ids, the clean top-1 token and probability, the clean top-``--top-logprobs`` log-probs, and
   per layer the totals ``sum |s|`` and ``sum s`` over all neurons (for the truncation check);
 * prompt metadata (prompt_id, slice, task, template_id, split, doc_id) joined from an optional
@@ -22,6 +22,7 @@ skip-if-exists), one row per prompt::
   manifest_index int64, block int32, prompt_id str, slice str, task str, template_id str, split str, doc_id str,
   source int16, row_index int64 (document row), position int64 (target position = final token of the prompt),
   token_ids list<int32> (tokens 0..position), y_hat int32, p_y_hat float32, logp_ga float32 (= log p_y_hat),
+  objective_value float32 (the attributed scalar: log p_y_hat, or the top-1 minus top-2 logit gap),
   top_ids list<int32>, top_logprobs list<float32> (clean next-token top-n), teacher_valid bool,
   idx list<uint16> [layers * k], s list<float32> [layers * k], h list<float16> [layers * k]   (layer-major, each
   layer's k entries in descending |s|), s_abs_sum list<float32> [layers], s_sum list<float32> [layers],
@@ -61,7 +62,9 @@ from neuron_communities.data.io import TokensReader, load_manifest_with_dataset,
 from neuron_communities.harvest.attribution import argmax_logprob
 from neuron_communities.tail import CachedTail, kv_bytes_per_row_token_layer, load_model
 
-WIDE_K = 50
+WIDE_K = 1000   # decided 2026-11-22: store the top 1,000 per layer (~259 KB/prompt on corpus prompts, ~544 GB for 2.1M).
+# To cut storage later, prune in place: keep the top 50, or (recommended) max(top 50, every neuron with |s| >= 0.1 x the
+# layer's max |s|), ~36 KB/prompt (~76 GB). Rows are in descending |s|, so both are prefixes of each layer's entries.
 # truncation statistics stored per prompt and layer (cheap: one sort of the layer's scores)
 SHARE_GRID = (5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000)   # share of sum |s| kept by the top k
 SHARE_LEVELS = (0.5, 0.8, 0.9, 0.95)                             # smallest k keeping this share
@@ -87,6 +90,11 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--kv-budget-gb", type=float, default=8.0)
     ap.add_argument("--forward-token-budget", type=int, default=49152)
     ap.add_argument("--max-parts", type=int, default=0, help="smoke/pilot: process at most this many parts of the shard")
+    ap.add_argument("--objective", choices=("logp", "logit_diff"), default="logp",
+                    help="logp: d log p(top-1)/dh (upstream); logit_diff: d (logit top-1 - logit top-2)/dh, which stays "
+                         "informative when the softmax is saturated")
+    ap.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16",
+                    help="model dtype (bfloat16 as upstream; float32 for small models)")
     ap.add_argument("--crosscheck-max-tokens", type=int, default=0,
                     help="run the naive full-backward crosscheck only on rows with at most this many tokens (0: no cap, "
                          "the upstream choice). The check is a diagnostic; stored attributions do not depend on it")
@@ -121,10 +129,12 @@ def model_revision(model, model_arg: str) -> str:
 def write_run_meta(args, model, out_dir: Path) -> None:
     import transformers
     meta = {
-        "stage": "attribution-wide", "score": "s = h * d log p(top-1) / dh, ranked by |s| (upstream act_ga)",
+        "stage": "attribution-wide", "objective": args.objective, "dtype": args.dtype,
+        "score": ("s = h * d log p(top-1) / dh, ranked by |s| (upstream act_ga)" if args.objective == "logp"
+                  else "s = h * d (logit top-1 - logit top-2) / dh, ranked by |s|"),
         "model": str(args.model), "model_revision": model_revision(model, args.model),
         "tokenizer": "the model's (prompts are pre-tokenised in the tokens dataset; see its provenance.json)",
-        "dtype": "bfloat16", "k": args.k, "base_k": args.base_k, "top_logprobs": args.top_logprobs,
+        "k": args.k, "base_k": args.base_k, "top_logprobs": args.top_logprobs,
         "block_size": args.block_size, "part_blocks": args.part_blocks, "kv_budget_gb": args.kv_budget_gb,
         "forward_token_budget": args.forward_token_budget, "manifest_dir": str(args.manifest_dir),
         "manifest_meta": load_meta(args.manifest_dir) if (args.manifest_dir / "meta.json").exists() else {},
@@ -167,11 +177,22 @@ def load_prompt_meta(manifest_dir: Path, n: int, split: str, slice_: str) -> dic
 
 # ---- the stage ------------------------------------------------------------------------------------------------------
 
+def objective_fn(name: str):
+    """Per-row (B,) scalar whose gradient is attributed: log p(top-1) (upstream) or logit(top-1) - logit(top-2)."""
+    if name == "logp":
+        return argmax_logprob
+
+    def logit_diff(logits: torch.Tensor) -> torch.Tensor:
+        top2 = torch.topk(logits.float(), 2, dim=-1).values
+        return top2[..., 0] - top2[..., 1]
+    return logit_diff
+
+
 def part_schema(n_layers: int, k: int) -> pa.Schema:
     return pa.schema([
         ("manifest_index", pa.int64()), ("block", pa.int32()), *[(f, pa.string()) for f in META_FIELDS],
         ("source", pa.int16()), ("row_index", pa.int64()), ("position", pa.int64()), ("token_ids", pa.list_(pa.int32())),
-        ("y_hat", pa.int32()), ("p_y_hat", pa.float32()), ("logp_ga", pa.float32()),
+        ("y_hat", pa.int32()), ("p_y_hat", pa.float32()), ("logp_ga", pa.float32()), ("objective_value", pa.float32()),
         ("top_ids", pa.list_(pa.int32())), ("top_logprobs", pa.list_(pa.float32())), ("teacher_valid", pa.bool_()),
         ("idx", pa.list_(pa.uint16())), ("s", pa.list_(pa.float32())), ("h", pa.list_(pa.float16())),
         ("s_abs_sum", pa.list_(pa.float32())), ("s_sum", pa.list_(pa.float32())),
@@ -203,7 +224,13 @@ def run(args: argparse.Namespace) -> None:
 
     pmeta = load_prompt_meta(args.manifest_dir, n_man, args.split, args.slice)
     tokens = TokensReader(dataset)
-    model = load_model(args.model, DEV)
+    if args.dtype == "bfloat16":
+        model = load_model(args.model, DEV)                       # the upstream loader
+    else:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32).to(DEV)
+        model.eval().requires_grad_(False)
+    objective = objective_fn(args.objective)
     write_run_meta(args, model, args.out_dir)
     n_layers = len(model.model.layers)
     layer0 = model.model.layers[0]
@@ -213,7 +240,10 @@ def run(args: argparse.Namespace) -> None:
     kv_bytes = kv_bytes_per_row_token_layer(model)
     check_layer = min(18, n_layers - 1)
     d_mlp = int(model.config.intermediate_size)
-    assert K <= d_mlp and d_mlp < 65536, "neuron indices are stored as uint16"
+    if K > d_mlp:
+        print(f"k={K} > d_mlp={d_mlp}: storing all {d_mlp} neurons per layer", flush=True)
+        K = d_mlp
+    assert d_mlp < 65536, "neuron indices are stored as uint16"
     schema = part_schema(n_layers, K)
 
     # ---- the next three functions are the upstream ones (attribution.py), with logits returned as well ----
@@ -272,7 +302,7 @@ def run(args: argparse.Namespace) -> None:
                     hd.remove()
             assert len(captured) == n_layers - 1, f"captured {len(captured)} tail MLP inputs"
             hs = [h0] + captured
-            loss = argmax_logprob(logits)
+            loss = objective(logits)
             g = torch.autograd.grad(loss.sum(), hs)
             grad = torch.stack([gi.reshape(gi.shape[0], -1).float() for gi in g])
         h = torch.stack([hi.detach().reshape(hi.shape[0], -1).float() for hi in hs])
@@ -290,7 +320,7 @@ def run(args: argparse.Namespace) -> None:
                 out = model.model(inputs_embeds=emb, attention_mask=attn_row)
                 hid = out.last_hidden_state[0, tpos_row]
                 logits = model.lm_head(hid)[None]
-                loss = argmax_logprob(logits)
+                loss = objective(logits)
                 g = torch.autograd.grad(loss.sum(), cap)
         finally:
             for hd in handles:
@@ -328,6 +358,7 @@ def run(args: argparse.Namespace) -> None:
             del srt, frac
             lp = torch.log_softmax(logits.float(), dim=-1)
             top_lp, top_id = torch.topk(lp, args.top_logprobs, dim=-1)
+            obj_val = loss.float().cpu().numpy()                   # the attributed scalar (= log p(top-1) for logp)
             h16 = hv.to(torch.float16)
             n_nonfinite_h += int((~torch.isfinite(h16)).sum())
             idx_c, s_c, h_c = idx.cpu().numpy(), s.cpu().numpy(), h16.cpu().numpy()
@@ -339,7 +370,7 @@ def run(args: argparse.Namespace) -> None:
                     "manifest_index": mi, "block": b, **{f: pmeta[f][mi] for f in META_FIELDS},
                     "source": int(pmeta["source"][mi]), "row_index": int(man_row[mi]), "position": int(man_pos[mi]),
                     "token_ids": toks[jj].to(torch.int32).numpy(), "y_hat": int(top_id_c[jj, 0]),
-                    "p_y_hat": float(np.exp(float(loss[jj]))), "logp_ga": float(loss[jj]),
+                    "p_y_hat": float(np.exp(top_lp_c[jj, 0])), "logp_ga": float(top_lp_c[jj, 0]), "objective_value": float(obj_val[jj]),
                     "top_ids": top_id_c[jj].astype(np.int32), "top_logprobs": top_lp_c[jj].astype(np.float32),
                     "teacher_valid": bool(valid[jj]),
                     "idx": idx_c[:, jj].astype(np.uint16).reshape(-1), "s": s_c[:, jj].astype(np.float32).reshape(-1),
@@ -386,7 +417,7 @@ def run(args: argparse.Namespace) -> None:
                       "rel_levels": list(REL_LEVELS),
                       "seconds": secs, "prompts": len(rows_out), "tokens": n_tok, "check_layer": check_layer,
                       "peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30 if DEV.startswith("cuda") else None,
-                      "crosscheck_max_tokens": args.crosscheck_max_tokens}
+                      "crosscheck_max_tokens": args.crosscheck_max_tokens, "objective": args.objective, "dtype": args.dtype}
         table = pa.Table.from_pylist(rows_out, schema=schema).replace_schema_metadata({"nc_wide": json.dumps(pmeta_json)})
         tmp = out_dir / f".part_{p:06d}.tmp.parquet"
         pq.write_table(table, tmp, compression="zstd")
