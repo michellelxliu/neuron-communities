@@ -92,6 +92,11 @@ def test_prompt_world_and_cap(g):
     s = json.loads(out)
     assert s["prompts_per_hour_per_device"] > 0 and len(s["topk_share_of_abs_s_by_layer"]["mean"]) == N_LAYERS
     assert all(0 < v <= 1.0001 for v in s["topk_share_of_abs_s_by_layer"]["mean"])
+    out = subprocess.run([str(x) for x in [sys.executable, ROOT / "scripts" / "gates" / "curve_summary.py", "--harvest", R / "pw_h"]],
+                         capture_output=True, text=True, check=True).stdout
+    c = json.loads(out)
+    assert c["n_prompts"] == 80 and c["compressed_bytes_per_entry"] > 0 and set(c["share_at_k"]) == {"5", "10", "20", "50"}
+    assert c["rules"]["top50"]["entries_per_prompt"] == 50 * N_LAYERS and c["rules"]["share95"]["entries_per_prompt"] > 0
 
 
 def test_gate1_script(g):
