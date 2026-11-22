@@ -24,7 +24,10 @@ skip-if-exists), one row per prompt::
   token_ids list<int32> (tokens 0..position), y_hat int32, p_y_hat float32, logp_ga float32 (= log p_y_hat),
   top_ids list<int32>, top_logprobs list<float32> (clean next-token top-n), teacher_valid bool,
   idx list<uint16> [layers * k], s list<float32> [layers * k], h list<float16> [layers * k]   (layer-major, each
-  layer's k entries in descending |s|), s_abs_sum list<float32> [layers], s_sum list<float32> [layers]
+  layer's k entries in descending |s|), s_abs_sum list<float32> [layers], s_sum list<float32> [layers],
+  share_at_k list<float32> [layers * len(SHARE_GRID)] (share of sum |s| in the top k, k in SHARE_GRID),
+  k_at_share list<int16> [layers * 4] (smallest k reaching 50/80/90/95% of sum |s|),
+  n_above_rel list<int16> [layers * 3] (neurons with |s| >= 0.1 / 0.01 / 0.001 x the layer's max |s|)
 
 The parquet schema metadata ``nc_wide`` (JSON) holds the part's k, base_k, layers, blocks, per-block crosscheck values
 (top-base_k and top-k overlap, gradient relative error) and timing. ``<out-dir>/run_meta.json`` records the model
@@ -59,6 +62,10 @@ from neuron_communities.harvest.attribution import argmax_logprob
 from neuron_communities.tail import CachedTail, kv_bytes_per_row_token_layer, load_model
 
 WIDE_K = 50
+# truncation statistics stored per prompt and layer (cheap: one sort of the layer's scores)
+SHARE_GRID = (5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000)   # share of sum |s| kept by the top k
+SHARE_LEVELS = (0.5, 0.8, 0.9, 0.95)                             # smallest k keeping this share
+REL_LEVELS = (0.1, 0.01, 0.001)                                  # neurons with |s| >= level * max |s|
 META_FIELDS = ("prompt_id", "slice", "task", "template_id", "split", "doc_id")
 
 
@@ -168,6 +175,7 @@ def part_schema(n_layers: int, k: int) -> pa.Schema:
         ("top_ids", pa.list_(pa.int32())), ("top_logprobs", pa.list_(pa.float32())), ("teacher_valid", pa.bool_()),
         ("idx", pa.list_(pa.uint16())), ("s", pa.list_(pa.float32())), ("h", pa.list_(pa.float16())),
         ("s_abs_sum", pa.list_(pa.float32())), ("s_sum", pa.list_(pa.float32())),
+        ("share_at_k", pa.list_(pa.float32())), ("k_at_share", pa.list_(pa.int16())), ("n_above_rel", pa.list_(pa.int16())),
     ])
 
 
@@ -311,6 +319,13 @@ def run(args: argparse.Namespace) -> None:
             assert torch.equal(s.abs(), val), "|s| must equal the upstream |h| x |grad| score"
             hv = torch.gather(h, -1, idx)
             abs_sum, sgn_sum = score.sum(-1), (h * grad).sum(-1)       # (L, B)
+            srt = torch.sort(score, dim=-1, descending=True).values
+            frac = srt.cumsum(-1) / abs_sum.unsqueeze(-1).clamp_min(1e-30)
+            share_k = frac[..., [k - 1 for k in SHARE_GRID if k <= d_mlp]]                       # (L, B, G)
+            k_share = torch.stack([(frac < lv).sum(-1) + 1 for lv in SHARE_LEVELS], -1).clamp_max(d_mlp)
+            n_rel = torch.stack([(srt >= lv * srt[..., :1]).sum(-1) for lv in REL_LEVELS], -1)
+            share_c, kshare_c, nrel_c = share_k.cpu().numpy(), k_share.cpu().numpy(), n_rel.cpu().numpy()
+            del srt, frac
             lp = torch.log_softmax(logits.float(), dim=-1)
             top_lp, top_id = torch.topk(lp, args.top_logprobs, dim=-1)
             h16 = hv.to(torch.float16)
@@ -330,6 +345,9 @@ def run(args: argparse.Namespace) -> None:
                     "idx": idx_c[:, jj].astype(np.uint16).reshape(-1), "s": s_c[:, jj].astype(np.float32).reshape(-1),
                     "h": h_c[:, jj].reshape(-1), "s_abs_sum": abs_c[:, jj].astype(np.float32),
                     "s_sum": sgn_c[:, jj].astype(np.float32),
+                    "share_at_k": share_c[:, jj].astype(np.float32).reshape(-1),
+                    "k_at_share": kshare_c[:, jj].astype(np.int16).reshape(-1),
+                    "n_above_rel": nrel_c[:, jj].astype(np.int16).reshape(-1),
                 }
                 n_tok += len(toks[jj])
             rng = np.random.default_rng(b * 131 + int(sub[0]))
@@ -364,6 +382,8 @@ def run(args: argparse.Namespace) -> None:
             n_tok += process_block(b, rows_out, blk_meta)
         secs = time.monotonic() - t0
         pmeta_json = {"part": p, "k": K, "base_k": K0, "layers": n_layers, "d_mlp": d_mlp, "blocks": blk_meta,
+                      "share_grid": [k for k in SHARE_GRID if k <= d_mlp], "share_levels": list(SHARE_LEVELS),
+                      "rel_levels": list(REL_LEVELS),
                       "seconds": secs, "prompts": len(rows_out), "tokens": n_tok, "check_layer": check_layer,
                       "peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30 if DEV.startswith("cuda") else None,
                       "crosscheck_max_tokens": args.crosscheck_max_tokens}

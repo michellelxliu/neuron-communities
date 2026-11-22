@@ -103,6 +103,13 @@ def test_wide_fields(w):
     assert all(len(set(r)) == KW for r in d["idx"].reshape(-1, KW)), "no repeats"
     assert (a.sum(-1) <= d["s_abs_sum"] * (1 + 1e-5) + 1e-30).all() and (d["s_abs_sum"] > 0).all()
     assert (d["s"] < 0).any() and (d["s"] > 0).any(), "signs are kept"
+    # truncation statistics: grid k = 5..50 (d_mlp = 64), consistent with the stored top-k and the totals
+    assert d["share_at_k"].shape == (n, N_LAYERS, 4) and d["k_at_share"].shape == (n, N_LAYERS, 4) and d["n_above_rel"].shape == (n, N_LAYERS, 3)
+    assert np.allclose(d["share_at_k"][:, :, 3], a.sum(-1) / d["s_abs_sum"], rtol=1e-4)
+    assert np.allclose(d["share_at_k"][:, :, 0], a[:, :, :5].sum(-1) / d["s_abs_sum"], rtol=1e-4)
+    assert (np.diff(d["share_at_k"], axis=-1) >= 0).all() and (np.diff(d["k_at_share"], axis=-1) >= 0).all()
+    assert (d["k_at_share"] >= 1).all() and (d["k_at_share"] <= D_MLP).all() and (np.diff(d["n_above_rel"], axis=-1) >= 0).all()
+    assert (d["n_above_rel"][:, :, 0] >= 1).all() and (d["n_above_rel"][:, :, 0] == (a >= 0.1 * a[:, :, :1]).sum(-1)).all()
     # s = h * grad: the sign of s matches h times the gradient's sign; check |h| matches the stored activation's scale
     assert (np.sign(d["s"]) != 0).mean() > 0.99
     # top-5 prefix agrees with the upstream blocks

@@ -49,9 +49,11 @@ def load_wide(harvest_dir: Path, columns: list[str] | None = None) -> dict[str, 
     out: dict[str, np.ndarray] = {}
     for name in tables[0].column_names:
         cols = [t.column(name) for t in tables]
-        if name in ("idx", "s", "h", "s_abs_sum", "s_sum"):
+        if name in ("idx", "s", "h", "s_abs_sum", "s_sum", "share_at_k", "k_at_share", "n_above_rel"):
             flat = np.concatenate([c.combine_chunks().values.to_numpy(zero_copy_only=False) for c in cols])
-            out[name] = flat.reshape(-1, L, K) if name in ("idx", "s", "h") else flat.reshape(-1, L)
+            n_rows = sum(len(c) for c in cols)
+            per_layer = len(flat) // (n_rows * L)                   # k for idx/s/h, 1 for totals, grid size for stats
+            out[name] = flat.reshape(n_rows, L) if name in ("s_abs_sum", "s_sum") else flat.reshape(n_rows, L, per_layer)
         elif name in ("token_ids", "top_ids", "top_logprobs"):
             out[name] = np.array([np.asarray(x) for c in cols for x in c.to_pylist()], dtype=object) \
                 if name == "token_ids" else np.stack([np.asarray(x) for c in cols for x in c.to_pylist()])
