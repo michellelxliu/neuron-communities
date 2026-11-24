@@ -18,17 +18,11 @@ export STAT236_SAS_FILE
 Q="$PY scripts/full/blobq.py --run $RUN"
 cfg=$($Q get-config) || { echo "worker: no run config in Blob"; exit 1; }
 cfgv() { echo "$cfg" | $PY -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {}, {'c': d}))" "$1"; }
-FLAGS=$(cfgv 'c["harvest_flags"]'); WANT=$(cfgv 'c["commit"]')
+FLAGS=$(cfgv 'c["harvest_flags"]'); WANT=$(cfgv 'c["code_hash"]')
 
-# the harvest code must be the run's commit (other files may differ)
-if git rev-parse HEAD >/dev/null 2>&1; then
-  git diff --quiet "$WANT" HEAD -- neuron_communities || { echo "worker: neuron_communities differs from run commit $WANT"; exit 1; }
-  git diff --quiet -- neuron_communities || { echo "worker: uncommitted changes in neuron_communities"; exit 1; }
-elif [ -f .code_commit ]; then
-  [ "$(cut -d' ' -f1 .code_commit)" = "$WANT" ] || { echo "worker: .code_commit is not run commit $WANT"; exit 1; }
-else
-  echo "worker: cannot verify the code commit"; exit 1
-fi
+# the harvest code (neuron_communities/*.py) must be the run's; works in git checkouts and synced copies alike
+HAVE=$($PY scripts/full/code_hash.py)
+[ "$HAVE" = "$WANT" ] || { echo "worker: neuron_communities hash $HAVE differs from the run's $WANT (commit $(cfgv 'c["commit"]'))"; exit 1; }
 
 LOGD=$WORK/$RUN/logs; mkdir -p "$LOGD"
 echo "worker $OWNER/$JOB_ID on $(hostname) device ${CUDA_VISIBLE_DEVICES:-?} start $(date -u +%FT%TZ)"
