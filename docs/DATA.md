@@ -9,10 +9,11 @@ github.com/goodfire-ai/neuron-communities, forked at github.com/michellelxliu/ne
 
 | Copy | What | Access |
 |---|---|---|
-| Azure Blob, prefix `stat236/` | everything, full width (top 1,000 neurons per layer), plus corpora, logs, configs | read-only SAS link from Michelle |
+| Azure Blob, container `stat236` (account `infinigenexploration`) | everything, full width (top 1,000 neurons per layer), plus corpora, logs, configs | SAS link from Michelle |
 | Hugging Face dataset (private, org) | the harvests, pruned (see below), with prompt metadata joined | org membership |
 
-`stat236/catalog.json` lists every Blob file with its size and MD5.
+`catalog.json` at the container root lists every Blob file with its size and MD5. The collaborator link can read
+files but cannot list the container, so take paths from the catalog.
 
 ## What a row holds
 
@@ -36,11 +37,11 @@ Global neuron id (Goodfire's convention): `layer * 14336 + idx`.
 
 | Name | Blob prefix | Rows | Notes |
 |---|---|---|---|
-| corpus world | `stat236/world_v1/` | 1.5M docs / 1.37B tokens; 979k train + 978k held-out prompts | Goodfire's sources and dedup (FineWeb-Edu sample-10BT 700k docs, Wikipedia 20231101.en 400k, FineMath-4plus 400k); `tokens/<corpus>/docs.parquet` maps rows to source ids |
-| pilot harvest | `stat236/world_v1/pilot_harvest/` | 100,000 | 50k / 25k / 25k sample of the training prompts |
-| arithmetic slice | `stat236/arith_v1/` | 16,575 discovery + 10,732 held-out | Feucht et al. (arXiv:2605.01148) tasks and Table 7 templates; disjoint templates and value pairs between splits; `ground_truth.json` = N_add, per-task sets, period clusters |
-| exploratory slices | `stat236/explore_v1/` | 11,114 discovery + 11,130 held-out | agreement (a/an, there is/are, subject–verb, fr/es/de), closing delimiters (code, HTML, LaTeX), in-context copying |
-| run outputs | `stat236/outputs/<run>/` | — | summaries, gate results, logs |
+| corpus world | `world_v1/` | 1.5M docs / 1.37B tokens; 979k train + 978k held-out prompts | Goodfire's sources and dedup (FineWeb-Edu sample-10BT 700k docs, Wikipedia 20231101.en 400k, FineMath-4plus 400k); `tokens/<corpus>/docs.parquet` maps rows to source ids |
+| pilot harvest | `world_v1/pilot_harvest/` | 100,000 | 50k / 25k / 25k sample of the training prompts |
+| arithmetic slice | `arith_v1/` | 16,575 discovery + 10,732 held-out | Feucht et al. (arXiv:2605.01148) tasks and Table 7 templates; disjoint templates and value pairs between splits; `ground_truth.json` = N_add, per-task sets, period clusters |
+| exploratory slices | `explore_v1/` | 11,114 discovery + 11,130 held-out | agreement (a/an, there is/are, subject–verb, fr/es/de), closing delimiters (code, HTML, LaTeX), in-context copying |
+| run outputs | `outputs/<run>/` | — | summaries, gate results, logs |
 
 Licences of the sources: FineWeb-Edu and FineMath ODC-By 1.0, Wikipedia CC BY-SA 4.0; model outputs under the
 Llama 3.1 Community License. Keep the data within the project until the paper's release decision.
@@ -57,10 +58,15 @@ L, kept = 18, row["n_kept"]
 start = sum(kept[:L]); layer18 = list(zip(row["idx"][start:start + kept[L]], row["s"][start:start + kept[L]]))
 ```
 
-From Blob with the read-only link (`SAS` is the part after `?`):
+From Blob with the collaborator link (`SAS` is the part after `?`; it has no list permission, so download by path):
 
-```bash
-azcopy copy "https://infinigenexploration.blob.core.windows.net/<container>/stat236/arith_v1/harvest_discovery?$SAS" . --recursive
+```python
+import json, urllib.request
+BASE, SAS = "https://infinigenexploration.blob.core.windows.net/stat236", "<sas>"
+cat = json.load(urllib.request.urlopen(f"{BASE}/catalog.json?{SAS}"))
+for f in cat["files"]:
+    if f["path"].startswith("arith_v1/harvest_discovery/"):
+        print(f["path"], f["bytes"])   # then: azcopy copy "{BASE}/{path}?{SAS}" <local path>
 ```
 
 ```python
