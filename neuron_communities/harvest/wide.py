@@ -90,6 +90,8 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--kv-budget-gb", type=float, default=8.0)
     ap.add_argument("--forward-token-budget", type=int, default=49152)
     ap.add_argument("--max-parts", type=int, default=0, help="smoke/pilot: process at most this many parts of the shard")
+    ap.add_argument("--part-range", default="", help="START:END, harvest parts START..END-1 instead of the --shard's "
+                    "range (used by the claim-based full-run worker, scripts/full/worker.sh)")
     ap.add_argument("--objective", choices=("logp", "logit_diff"), default="logp",
                     help="logp: d log p(top-1)/dh (upstream); logit_diff: d (logit top-1 - logit top-2)/dh, which stays "
                          "informative when the softmax is saturated")
@@ -210,6 +212,10 @@ def run(args: argparse.Namespace) -> None:
     n_parts = (n_blocks + args.part_blocks - 1) // args.part_blocks
     pps = (n_parts + args.shards - 1) // args.shards
     my_parts = list(range(args.shard * pps, min((args.shard + 1) * pps, n_parts)))
+    if args.part_range:
+        lo, hi = (int(x) for x in args.part_range.split(":"))
+        assert 0 <= lo < hi, f"bad --part-range {args.part_range}"
+        my_parts = list(range(lo, min(hi, n_parts)))
     out_dir = args.out_dir / "parts"
     out_dir.mkdir(parents=True, exist_ok=True)
     todo = [p for p in my_parts if not (out_dir / f"part_{p:06d}.parquet").exists()]
