@@ -26,6 +26,8 @@ def main() -> None:
     ap.add_argument("--harvest", type=Path, required=True)
     ap.add_argument("--prompts", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--model", default=None, help="tokenizer: also count a top-1 token that is a non-empty prefix of the "
+                                                   "answer string (')' for an answer '))') as correct ('accuracy_prefix')")
     a = ap.parse_args()
     t = load_wide(a.harvest, columns=["manifest_index", "y_hat", "top_ids", "top_logprobs", "idx"])
     pm = pq.read_table(a.prompts / "prompts.parquet").to_pandas().set_index("manifest_index")
@@ -34,6 +36,17 @@ def main() -> None:
     ans = pm.loc[mi, "answer_token"].astype(np.int64).to_numpy(); alt = pm.loc[mi, "alt_token"].astype(np.int64).to_numpy()
     y = np.asarray(t["y_hat"], np.int64); top = t["top_ids"].astype(np.int64)
     correct = y == ans
+    prefix_ok = correct.copy()
+    if a.model:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(a.model)
+        full = pm.loc[mi, "answer"].to_numpy()
+        shared = pm.loc[mi, "shared_prefix"].to_numpy() if "shared_prefix" in pm.columns else np.full(len(mi), "")
+        for j in range(len(mi)):
+            if not prefix_ok[j]:
+                d = tok.decode([int(y[j])])
+                rest = full[j][len(shared[j]):] if shared[j] and full[j].startswith(shared[j]) else full[j]
+                prefix_ok[j] = bool(d) and rest.startswith(d)
     def rank(tokens):                                         # position in the top-20, 99 when absent
         hit = top == tokens[:, None]
         return np.where(hit.any(1), hit.argmax(1), 99)
@@ -43,7 +56,8 @@ def main() -> None:
     res = {"n": int(len(mi)), "tasks": {}}
     for tk in sorted(set(task)):
         m = task == tk
-        r = {"n": int(m.sum()), "accuracy": round(float(correct[m].mean()), 4), "answer_in_top20": round(float((ra[m] < 99).mean()), 4)}
+        r = {"n": int(m.sum()), "accuracy": round(float(correct[m].mean()), 4),
+             "accuracy_prefix": round(float(prefix_ok[m].mean()), 4), "answer_in_top20": round(float((ra[m] < 99).mean()), 4)}
         if has_alt[m].any():
             r["prefers_answer_over_alt"] = round(float(prefer[m & has_alt].mean()), 4)
         r["templates"] = {tp: {"n": int((m & (tid == tp)).sum()), "accuracy": round(float(correct[m & (tid == tp)].mean()), 4)}
