@@ -20,7 +20,7 @@ for split in discovery heldout; do
   echo "harvest $split: $(( $(date +%s) - t0 )) s"
   cp "$A/harvest_$split"/run_meta_shard*.json "$OUT/run_meta_$split.json"
   $PY scripts/gates/arith_summary.py --harvest "$A/harvest_$split" --prompts "$A/$split" --truth "$A/ground_truth.json" \
-      --out "$OUT/summary_$split.json" && echo "summary $split ok"
+      --out "$OUT/summary_$split.json" --model "$SNAP" && echo "summary $split ok"
 done
 cp .code_commit "$OUT/" 2>/dev/null || true
 [ $ok = 1 ] || { echo ARITH=failed; exit 1; }
