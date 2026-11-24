@@ -16,6 +16,8 @@ STAGES: list[tuple[str, str, str]] = [
     ("dedup",         "neuron_communities.data.dedup",       "window-64 leader dedup of a manifest, plus exact dedup of short contexts"),
     ("combine",       "neuron_communities.data.combine",     "concatenate per-corpus manifests into one world"),
     ("heldout-dedup", "neuron_communities.data.heldout",     "drop held-out prompts that collide with the training manifest"),
+    ("prompt-meta",   "neuron_communities.data.prompt_meta", "per-prompt id, split and source doc id of a manifest (prompts.parquet)"),
+    ("subset",        "neuron_communities.data.subset",      "a manifest of a subset of another manifest's deduplicated prompts"),
     ("attribution",   "neuron_communities.harvest.attribution", "top-k activation x gradient neuron sets per prompt and layer"),
     ("attribution-wide", "neuron_communities.harvest.wide",  "top-50 signed activation x gradient scores per prompt and layer (parquet)"),
     ("wide-blocks",   "neuron_communities.harvest.wide_blocks", "top-k prefix of a wide harvest in the attribution block layout"),

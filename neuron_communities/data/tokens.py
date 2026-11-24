@@ -6,6 +6,8 @@ the harvest does (the model's tokenizer, BOS prepended, truncated to ``--max-len
   <out>/index.sqlite                             sequence_locations(sequence_id, chunk_id, offset, count)
                                                  (+ empty sequence_metadata / token_positions for schema parity)
   <out>/layers/tokens/chunk_XXXXXX.safetensors   token_ids (int32, documents concatenated)
+  <out>/docs.parquet                             row (int64, = sequence_locations rowid - 1), doc_id (the record's
+                                                 ``id`` field, else its url), url: the source document of every row
   <out>/metadata.json, <out>/provenance.json
 
 No activations are stored: the sampling, dedup and harvest stages only ever read token_ids, so this is all a
@@ -22,6 +24,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 from datasets import load_dataset
 from safetensors.torch import save_file
@@ -62,6 +66,7 @@ def run(a: argparse.Namespace) -> None:
     n_docs = 0
     total_tokens = 0
     urls = []
+    doc_ids = []
     batch_rows = []
 
     def flush():
@@ -86,7 +91,8 @@ def run(a: argparse.Namespace) -> None:
         batch_rows.append((f"seq_{n_docs}", chunk_id, buf_len, len(ids)))
         buf.append(np.asarray(ids, dtype=np.int32)); buf_len += len(ids)
         total_tokens += len(ids); n_docs += 1
-        urls.append(ex.get("url") or ex.get("id") or "")
+        urls.append(str(ex.get("url") or ""))
+        doc_ids.append(str(ex.get("id") or ex.get("url") or ""))
         if len(batch_rows) >= 1000:
             conn.executemany("INSERT INTO sequence_locations VALUES (?,?,?,?)", batch_rows); conn.commit(); batch_rows = []
         if n_docs % 5000 == 0:
@@ -97,6 +103,8 @@ def run(a: argparse.Namespace) -> None:
     if batch_rows:
         conn.executemany("INSERT INTO sequence_locations VALUES (?,?,?,?)", batch_rows); conn.commit()
     conn.close()
+    pq.write_table(pa.table({"row": pa.array(np.arange(n_docs, dtype=np.int64)), "doc_id": pa.array(doc_ids, pa.string()),
+                             "url": pa.array(urls, pa.string())}), out / "docs.parquet")
     (out / "metadata.json").write_text(json.dumps({
         "mode": "token", "tokens_only": True, "num_chunks": chunk_id, "total_items": total_tokens,
         "chunks": chunks_meta, "has_token_ids": True, "layers": [], "d_models": {},
@@ -105,6 +113,7 @@ def run(a: argparse.Namespace) -> None:
         "hf_dataset": a.hf_dataset, "hf_config": a.hf_config, "split": a.split, "text_field": a.text_field,
         "n_docs": n_docs, "min_chars": a.min_chars, "max_length": a.max_length, "seed": a.seed,
         "shuffle_buffer": a.shuffle_buffer, "tokenizer": a.model, "total_tokens": total_tokens,
-        "sample_urls": urls[:50]}, indent=1))
+        "doc_ids": "docs.parquet (one row per document)",
+        "n_docs_with_id": int(sum(bool(d) for d in doc_ids)), "sample_urls": urls[:50]}, indent=1))
     print(f"done: {n_docs:,} docs, {total_tokens:,} tokens, {chunk_id} chunks -> {out} "
           f"({(time.monotonic() - t0) / 60:.1f} min)", flush=True)
