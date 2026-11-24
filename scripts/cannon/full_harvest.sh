@@ -23,5 +23,5 @@ for i in $(seq 0 $((N - 1))); do
   pids+=($!); sleep 20   # stagger model loads
 done
 for i in "${!pids[@]}"; do wait "${pids[$i]}"; echo "worker $i exit $?: $(tail -1 "$OUT/worker_$i.log")"; done
-$PY scripts/full/blobq.py status
+$PY scripts/full/blobq.py --run ${RUN:-full_v1} status -v
 echo "FULL_JOB_END"
