@@ -14,7 +14,7 @@ for c in sorted(p for p in (root / "data").iterdir() if p.is_dir()):
         for s in splits:
             lines += [f"  - split: {s}", f"    path: data/{c.name}/{s}-*.parquet"]
         cfgs.append("\n".join(lines))
-header = "---\nlicense: other\nlicense_name: mixed (see card)\npretty_name: Llama-3.1-8B neuron attributions (Stat 236)\n" \
+header = "---\nlicense: other\nlicense_name: mixed-see-card\npretty_name: Llama-3.1-8B neuron attributions (Stat 236)\n" \
          "configs:\n" + "\n".join(cfgs) + "\n---\n\n"
 (root / "README.md").write_text(header + (repo / "docs" / "DATA.md").read_text()
                                 .replace("<org>/<repo>", "stat236/llama31-8b-neuron-attributions"))
