@@ -14,8 +14,9 @@ mapfile -t DEV < <(nvidia-smi -L | sed -n 's/.*(UUID: \(MIG-[^)]*\)).*/\1/p')
 N=${#DEV[@]}
 # end of this job's time limit; workers claim no chunk that would not finish before it
 end=$(squeue -j "${SLURM_JOB_ID}" -h -o %e 2>/dev/null); export DEADLINE=$(( $(date -d "$end" +%s 2>/dev/null || echo 0) - 900 ))
-# this owner's running Slurm jobs (workers are named <job>.<device>), so claims of dead jobs can be taken back
-export LIVE_JOBS=$(squeue --me -h -o %i | while read -r j; do for i in $(seq 0 15); do printf '%s.%s,' "$j" "$i"; done; done)
+# this owner's running Slurm jobs (workers are named <job>.<device>), so claims of dead jobs can be taken back;
+# read again before every claim (scripts/full/worker.sh), so jobs started after this one count as alive
+export LIVE_JOBS_CMD='squeue --me -h -o %i | while read -r j; do for i in $(seq 0 15); do printf "%s.%s," "$j" "$i"; done; done'
 echo "devices $N, deadline $(date -u -d @$DEADLINE +%FT%TZ), owner $OWNER"
 pids=()
 for i in $(seq 0 $((N - 1))); do

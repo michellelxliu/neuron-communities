@@ -82,5 +82,10 @@ python scripts/full/blobq.py release --split train --chunk 17 --owner <name>   #
 ```
 
 When a worker dies, find its claims with `status -v`. Release them, or rerun with the same `OWNER`: the new job
-takes back claims of yours whose job id is not running. On Cannon `full_harvest.sh` passes your running jobs
-automatically; elsewhere pass `LIVE_JOBS` (a comma list of your running `JOB_ID`s).
+takes back claims of yours whose job id is not running. A worker reads the list of your running jobs right before
+each claim. On Cannon, `full_harvest.sh` sets this up from `squeue`. Elsewhere, set `LIVE_JOBS_CMD` to a command that
+prints a comma list of your running `JOB_ID`s. A fixed `LIVE_JOBS` list is only safe if you start no other worker
+later: workers started after it would look dead and lose their chunks. If the list does not name the worker
+itself, the worker takes back nothing.
+
+Each worker stages its parts in `$WORK/full_v1/stage/<JOB_ID>/` and deletes them once they are verified in Blob.

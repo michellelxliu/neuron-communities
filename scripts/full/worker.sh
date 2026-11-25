@@ -7,9 +7,12 @@
 #                WORK (dir with world_v1/ from fetch_inputs.py; parts are staged in $WORK/full_v1),
 #                MODEL (local Llama-3.1-8B snapshot dir), STAT236_SAS_FILE (FILE:VAR holding the container SAS)
 # Optional env:  PY (python, default python3), DEADLINE (epoch s: claim no new chunk after DEADLINE - CHUNK_SECONDS),
-#                CHUNK_SECONDS (default 5400), LIVE_JOBS (comma list of this OWNER's running JOB_IDs: claims of yours
-#                under other ids are from dead jobs and are taken back), MEM_FLAGS (memory-only harvest flags; default
-#                fits a 20 GB A100 MIG slice; outputs do not depend on them), RUN (default full_v1)
+#                CHUNK_SECONDS (default 5400), LIVE_JOBS_CMD (shell command printing a comma list of this OWNER's
+#                running JOB_IDs; run before every claim, so claims of yours under other ids are known to be from dead
+#                jobs and are taken back; full_harvest.sh sets it from squeue), LIVE_JOBS (a fixed list instead; only
+#                safe when no job of yours starts later), MEM_FLAGS (memory-only harvest flags; default fits a 20 GB
+#                A100 MIG slice; outputs do not depend on them), RUN (default full_v1)
+# Parts are staged in $WORK/$RUN/stage/$JOB_ID, private to this worker.
 set -uo pipefail
 : "${OWNER:?}" "${JOB_ID:?}" "${WORK:?}" "${MODEL:?}" "${STAT236_SAS_FILE:?}"
 PY=${PY:-python3}; RUN=${RUN:-full_v1}; CHUNK_SECONDS=${CHUNK_SECONDS:-5400}; DEADLINE=${DEADLINE:-0}
@@ -31,11 +34,16 @@ while true; do
   if [ "$DEADLINE" -gt 0 ] && [ $(( $(date +%s) + CHUNK_SECONDS )) -gt "$DEADLINE" ]; then
     echo "worker: deadline near, stopping after $n chunks"; break
   fi
-  spec=$($Q claim --owner "$OWNER" --job "$JOB_ID" --live-jobs "${LIVE_JOBS:-}"); rc=$?
+  # which of this owner's jobs are alive, read now (a list from job start would miss jobs started since)
+  live=${LIVE_JOBS:-}; retake=()
+  if [ -n "${LIVE_JOBS_CMD:-}" ]; then live=$(eval "$LIVE_JOBS_CMD" 2>/dev/null) || live=""; fi
+  # take back dead claims only when the list is trustworthy: it must name this worker
+  case ",$live," in *",$JOB_ID,"*) ;; *) retake=(--no-retake-dead) ;; esac
+  spec=$($Q claim --owner "$OWNER" --job "$JOB_ID" --live-jobs "$live" "${retake[@]}"); rc=$?
   [ $rc = 3 ] && { echo "worker: no free chunks left, $n done"; break; }
   [ $rc = 0 ] || { echo "worker: claim failed rc=$rc"; exit 1; }
   read -r split chunk lo hi <<< "$spec"
-  H=$WORK/$RUN/$split; log=$LOGD/${split}_$(printf %05d "$chunk").log
+  S=$WORK/$RUN/stage/$JOB_ID; rm -rf "$S"; H=$S/$split; log=$LOGD/${split}_$(printf %05d "$chunk")_$JOB_ID.log
   echo "$(date -u +%TZ) chunk $split $chunk parts $lo..$((hi - 1))"
   t0=$(date +%s)
   # --shard = chunk id only names this chunk's run_meta file; --part-range selects the parts
@@ -47,15 +55,18 @@ while true; do
   for p in $(seq "$lo" $((hi - 1))); do
     f=$H/parts/part_$(printf %06d "$p").parquet
     [ -f "$f" ] || { echo "worker: missing $f"; exit 1; }
+    sz=$(stat -c %s "$f") || { echo "worker: cannot stat $f"; exit 1; }
     r=$($Q put "$f" "$RUN/$split/parts/$(basename "$f")") || { echo "worker: upload failed $f"; exit 1; }
-    bytes=$(( bytes + $(stat -c %s "$f") )); up=$((up + 1))
+    # a part already in Blob from an earlier attempt is kept (first writer wins); say so if its bytes differ
+    grep -q '"same": false' <<< "$r" && echo "worker: kept existing blob for $(basename "$f"); local copy differs: $r"
+    bytes=$(( bytes + sz )); up=$((up + 1))
   done
   meta=$H/run_meta_shard$(printf %04d "$chunk").json
   [ -f "$meta" ] && $Q put "$meta" "$RUN/$split/run_meta/chunk_$(printf %05d "$chunk")_${OWNER}_${JOB_ID}.json" > /dev/null
   $Q put "$log" "$RUN/logs/$OWNER/${split}_$(printf %05d "$chunk")_${JOB_ID}.log" > /dev/null
   $Q done --split "$split" --chunk "$chunk" --owner "$OWNER" \
       --info "{\"job\": \"$JOB_ID\", \"host\": \"$(hostname)\", \"parts\": $up, \"bytes\": $bytes, \"harvest_s\": $((t1 - t0)), \"upload_s\": $(( $(date +%s) - t1 ))}"
-  for p in $(seq "$lo" $((hi - 1))); do rm -f "$H/parts/part_$(printf %06d "$p").parquet"; done   # verified in Blob
+  rm -rf "$S"   # parts verified in Blob
   n=$((n + 1))
   echo "$(date -u +%TZ) chunk $split $chunk done: harvest $((t1 - t0)) s, upload $(( $(date +%s) - t1 )) s, $((bytes / 1000000)) MB"
 done
